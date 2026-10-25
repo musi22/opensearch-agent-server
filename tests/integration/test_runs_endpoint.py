@@ -37,6 +37,7 @@ from orchestrator.router import PageContextRouter
 from server import ag_ui_app
 from server.ag_ui_app import app, get_orchestrator
 from server.agent_orchestrator import AgentOrchestrator
+from server.constants import DEFAULT_EVENT_LIMIT
 from server.run_manager import get_run_manager
 
 pytestmark = pytest.mark.integration
@@ -229,6 +230,24 @@ class TestCreateRunEndpoint:
         assert first_event["type"] == "RUN_STARTED"
         assert last_event["type"] == "RUN_FINISHED"
 
+    def test_create_run_duplicate_returns_409(
+        self,
+        client: TestClient,
+        mock_persistence: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """When a run with status='running' already exists in persistence, returns HTTP 409."""
+        mock_persistence.get_run.return_value = {"id": "r1", "status": "running"}
+        monkeypatch.setattr(ag_ui_app, "persistence", mock_persistence)
+        payload = {
+            "threadId": "t1",
+            "runId": "r1",
+            "state": {},
+            "messages": [{"id": "m1", "role": "user", "content": "hi"}],
+        }
+        resp = client.post("/runs", json=payload)
+        assert resp.status_code == 409
+
     def test_create_run_with_persistence_enabled(
         self,
         client: TestClient,
@@ -387,6 +406,29 @@ class TestCancelRunEndpoint:
                     pass
             await run_manager.unregister_run(run_id)
 
+    @pytest.mark.asyncio
+    async def test_cancel_active_but_already_completed_run(self, client: TestClient):
+        """When an active run's underlying task has already completed, returns canceled: False."""
+        run_manager = get_run_manager()
+        run_id = "run-active-completed-1"
+
+        async def dummy_completed_task():
+            return "done"
+
+        task = asyncio.create_task(dummy_completed_task())
+        await task
+        await run_manager.register_run(run_id, task)
+
+        try:
+            resp = client.post(f"/runs/{run_id}/cancel")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["runId"] == run_id
+            assert data["canceled"] is False
+            assert "already completed" in data["message"]
+        finally:
+            await run_manager.unregister_run(run_id)
+
     def test_cancel_already_canceled_run(self, client: TestClient):
         """Canceling an already canceled run returns canceled: True with appropriate message."""
         run_manager = get_run_manager()
@@ -539,7 +581,7 @@ class TestGetRunEventsEndpoint:
         mock_persistence.get_events.assert_called_once_with(
             run_id="run-events-filter",
             event_type="TEXT_MESSAGE_CONTENT",
-            limit=1000,
+            limit=DEFAULT_EVENT_LIMIT,
             offset=0,
         )
 
